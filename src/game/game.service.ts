@@ -1,264 +1,116 @@
+// game.service.ts
 import { Injectable } from '@nestjs/common';
-import { RoomService } from '../room/room.service';
-import { WordService } from '../word/word.service';
-import { GameState } from '../interfaces/game.interface';
+import { Server } from 'socket.io';
+import { RoomService } from 'src/room/room.service';
+import { WordService } from 'src/word/word.service';
 
 @Injectable()
 export class GameService {
+  private server: Server;
+
   constructor(
-    private roomService: RoomService,
-    private wordService: WordService,
+    private readonly roomService: RoomService,
+    private readonly wordService: WordService,
   ) {}
 
-  createRoom(hostId: string, hostName: string) {
-    return this.roomService.createRoom(hostId, hostName);
+  setServer(server: Server) {
+    this.server = server;
   }
 
-  joinRoom(code: string, playerId: string, playerName: string) {
-    const room = this.roomService.findRoomByCode(code);
-    
-    if (!room) {
-      return { success: false, error: 'ROOM_NOT_FOUND' };
-    }
+  startGame(roomCode: string) {
+    const room = this.roomService.getRoom(roomCode);
+    if (!room || room.state !== GameState.Waiting) return;
 
-    if (room.players.length >= room.maxPlayers) {
-      return { success: false, error: 'ROOM_FULL' };
-    }
+    room.players.forEach((p) => {
+      p.isAlive = true;
+      p.wordSubmitted = false;
+      p.score = 0;
+    });
 
-    const player = this.roomService.addPlayerToRoom(room.id, playerId, playerName);
-    
-    if (!player) {
-      return { success: false, error: 'FAILED_TO_JOIN' };
-    }
+    room.state = GameState.InProgress;
+    room.turnIndex = 0;
+    this.scheduleTurn(roomCode);
 
-    return { success: true, room, player };
+    this.server.to(roomCode).emit('GameUpdated', this.getPublicRoomState(room));
   }
 
-  startGame(roomId: string, hostId: string) {
-    const room = this.roomService.getRoom(roomId);
-    
-    if (!room) {
-      return { success: false, error: 'ROOM_NOT_FOUND' };
-    }
+  private scheduleTurn(roomCode: string) {
+    const room = this.roomService.getRoom(roomCode);
+    if (!room) return;
 
-    const host = room.players.find(p => p.id === hostId && p.isHost);
-    if (!host) {
-      return { success: false, error: 'NOT_HOST' };
-    }
+    const currentPlayer = room.players[room.turnIndex];
+    room.currentBombIndex = this.wordService.getRandomBombIndices();
+    currentPlayer.wordSubmitted = false;
 
-    if (room.players.length < 2) {
-      return { success: false, error: 'NOT_ENOUGH_PLAYERS' };
-    }
+    this.server.to(roomCode).emit('TurnChanged', currentPlayer.name);
 
-    const started = this.roomService.startGame(roomId);
-    if (!started) {
-      return { success: false, error: 'FAILED_TO_START' };
-    }
-
-    // Generar primera bomba
-    const bombIndices = this.wordService.getRandomBombIndices();
-    room.currentBomb = bombIndices;
-
-    return { success: true, room, bombIndices };
+    setTimeout(() => this.handleTimeUp(roomCode), room.turnDuration);
   }
 
-  handlePlayerTyping(roomId: string, playerId: string, word: string) {
-    const room = this.roomService.getRoom(roomId);
-    if (!room || room.gameState !== GameState.PLAYING) {
-      return { success: false, error: 'INVALID_GAME_STATE' };
+  private handleTimeUp(roomCode: string) {
+    const room = this.roomService.getRoom(roomCode);
+    if (!room || room.state !== GameState.InProgress) return;
+
+    const currentPlayer = room.players[room.turnIndex];
+
+    if (!currentPlayer.wordSubmitted && currentPlayer.isAlive) {
+      currentPlayer.isAlive = false;
+      this.server.to(roomCode).emit('PlayerEliminated', currentPlayer.name);
     }
 
-    const player = room.players.find(p => p.id === playerId);
-    if (!player || !player.isAlive) {
-      return { success: false, error: 'PLAYER_NOT_FOUND_OR_ELIMINATED' };
-    }
-
-    // Actualizar palabra actual del jugador
-    this.roomService.updatePlayerWord(roomId, playerId, word);
-
-    // Verificar si la palabra contiene los indices de la bomba
-    const hasValidIndices = this.wordService.checkWordProgress(word, room.currentBomb);
-
-    return {
-      success: true,
-      playerId,
-      word,
-      hasValidIndices
-    };
+    this.advanceTurn(roomCode);
   }
 
-  submitWord(roomId: string, playerId: string, word: string) {
-    const room = this.roomService.getRoom(roomId);
-    if (!room || room.gameState !== GameState.PLAYING) {
-      return { success: false, error: 'INVALID_GAME_STATE' };
+  private advanceTurn(roomCode: string) {
+    const room = this.roomService.getRoom(roomCode);
+    if (!room) return;
+
+    const alivePlayers = room.players.filter((p) => p.isAlive);
+    if (alivePlayers.length <= 1) {
+      room.state = GameState.Finished;
+      this.server.to(roomCode).emit('GameEnded', this.getPublicRoomState(room));
+      return;
     }
 
-    const currentPlayer = this.roomService.getCurrentPlayer(roomId);
-    if (!currentPlayer || currentPlayer.id !== playerId) {
-      return { success: false, error: 'NOT_YOUR_TURN' };
-    }
+    do {
+      room.turnIndex = (room.turnIndex + 1) % room.players.length;
+    } while (!room.players[room.turnIndex].isAlive);
 
-    // Validar palabra
-    const isValid = this.wordService.validateWord(word, room.currentBomb);
-    
+    this.scheduleTurn(roomCode);
+  }
+
+  submitWord(roomCode: string, playerId: string, word: string): boolean {
+    const room = this.roomService.getRoom(roomCode);
+    if (!room || room.state !== GameState.InProgress) return false;
+
+    const player = room.players.find((p) => p.id === playerId);
+    if (!player || !player.isAlive || player.wordSubmitted) return false;
+
+    const isValid = this.wordService.validateWord(word, room.currentBombIndex);
+
     if (isValid) {
-      // Palabra válida - jugador pasa el turno
-      this.roomService.submitWord(roomId, playerId, word);
-      
-      // Cambiar turno
-      const nextPlayerId = this.roomService.nextTurn(roomId);
-      
-      // Generar nueva bomba
-      const newBombIndices = this.wordService.getRandomBombIndices();
-      room.currentBomb = newBombIndices;
-
-      // Verificar si el juego terminó
-      const winner = this.roomService.getWinner(roomId);
-      
-      return {
-        success: true,
-        isValid: true,
-        word,
-        playerId,
-        nextPlayerId,
-        newBombIndices,
-        winner,
-        gameFinished: !!winner
-      };
+      player.score++;
+      player.wordSubmitted = true;
+      this.server.to(roomCode).emit('WordAccepted', { playerId, word });
+      return true;
     } else {
-      // Palabra inválida - jugador pierde vida
-      const eliminatedPlayer = this.roomService.eliminatePlayer(roomId, playerId);
-      
-      if (eliminatedPlayer && eliminatedPlayer.lives <= 0) {
-        // Jugador eliminado
-        const winner = this.roomService.getWinner(roomId);
-        
-        if (winner) {
-          // Juego terminado
-          return {
-            success: true,
-            isValid: false,
-            word,
-            playerId,
-            eliminatedPlayer,
-            winner,
-            gameFinished: true
-          };
-        } else {
-          // Continuar con el siguiente turno
-          const nextPlayerId = this.roomService.nextTurn(roomId);
-          const newBombIndices = this.wordService.getRandomBombIndices();
-          room.currentBomb = newBombIndices;
-          
-          return {
-            success: true,
-            isValid: false,
-            word,
-            playerId,
-            eliminatedPlayer,
-            nextPlayerId,
-            newBombIndices,
-            gameFinished: false
-          };
-        }
-      } else {
-        // Jugador perdió vida pero sigue vivo, continuar turno
-        return {
-          success: true,
-          isValid: false,
-          word,
-          playerId,
-          eliminatedPlayer,
-          gameFinished: false
-        };
-      }
+      player.isAlive = false;
+      this.server.to(roomCode).emit('PlayerEliminated', player.name);
+      return false;
     }
   }
 
-  handleTimeUp(roomId: string) {
-    const room = this.roomService.getRoom(roomId);
-    if (!room || room.gameState !== GameState.PLAYING) {
-      return { success: false, error: 'INVALID_GAME_STATE' };
-    }
-
-    const currentPlayer = this.roomService.getCurrentPlayer(roomId);
-    if (!currentPlayer) {
-      return { success: false, error: 'NO_CURRENT_PLAYER' };
-    }
-
-    // El tiempo se agotó - jugador pierde vida
-    const eliminatedPlayer = this.roomService.eliminatePlayer(roomId, currentPlayer.id);
-    
-    if (eliminatedPlayer && eliminatedPlayer.lives <= 0) {
-      // Jugador eliminado
-      const winner = this.roomService.getWinner(roomId);
-      
-      if (winner) {
-        // Juego terminado
-        return {
-          success: true,
-          timeUp: true,
-          eliminatedPlayer,
-          winner,
-          gameFinished: true
-        };
-      }
-    }
-
-    // Continuar con el siguiente turno
-    const nextPlayerId = this.roomService.nextTurn(roomId);
-    const newBombIndices = this.wordService.getRandomBombIndices();
-    room.currentBomb = newBombIndices;
-
+  getPublicRoomState(room: any) {
     return {
-      success: true,
-      timeUp: true,
-      eliminatedPlayer,
-      nextPlayerId,
-      newBombIndices,
-      gameFinished: false
+      code: room.code,
+      state: room.state,
+      players: room.players.map((p) => ({
+        id: p.id,
+        name: p.name,
+        isAlive: p.isAlive,
+        score: p.score,
+      })),
+      currentBombIndex: room.currentBombIndex,
     };
-  }
-
-  returnToLobby(roomId: string, playerId: string) {
-    const room = this.roomService.getRoom(roomId);
-    if (!room) {
-      return { success: false, error: 'ROOM_NOT_FOUND' };
-    }
-
-    const player = room.players.find(p => p.id === playerId);
-    if (!player) {
-      return { success: false, error: 'PLAYER_NOT_FOUND' };
-    }
-
-    // Solo el host puede regresar al lobby
-    if (!player.isHost) {
-      return { success: false, error: 'NOT_HOST' };
-    }
-
-    const reset = this.roomService.resetRoomToLobby(roomId);
-    if (!reset) {
-      return { success: false, error: 'FAILED_TO_RESET' };
-    }
-
-    return { success: true, room };
-  }
-
-  leaveRoom(playerId: string) {
-    const room = this.roomService.findRoomByPlayerId(playerId);
-    if (!room) {
-      return { success: false, error: 'PLAYER_NOT_IN_ROOM' };
-    }
-
-    const removed = this.roomService.removePlayerFromRoom(room.id, playerId);
-    return { success: removed, room: removed ? room : null };
-  }
-
-  getRoomByPlayerId(playerId: string) {
-    return this.roomService.findRoomByPlayerId(playerId);
-  }
-
-  getRoom(roomId: string) {
-    return this.roomService.getRoom(roomId);
   }
 }

@@ -1,274 +1,165 @@
-import { Injectable } from '@nestjs/common';
-import { Room, Player, GameState } from '../interfaces/game.interface';
+import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { GameState } from 'src/interfaces/game-state.enum';
+import { Player } from 'src/interfaces/Player.entity';
+import { Room } from 'src/interfaces/Room.entity';
+import { Repository } from 'typeorm';
 
 @Injectable()
 export class RoomService {
-  private rooms: Map<string, Room> = new Map();
+  constructor(
+    @InjectRepository(Room)
+    private readonly roomRepo: Repository<Room>,
 
-  generateRoomCode(): string {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    let result = '';
-    for (let i = 0; i < 4; i++) {
-      result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
-  }
+    @InjectRepository(Player)
+    private readonly playerRepo: Repository<Player>,
+  ) {}
 
-  createRoom(hostId: string, hostName: string): Room {
-    const roomId = this.generateUniqueRoomId();
-    const roomCode = this.generateUniqueRoomCode();
-
-    const host: Player = {
-      id: hostId,
-      name: hostName,
-      score: 0,
-      isHost: true,
-      currentWord: '',
-      isAlive: true,
-      lives: 3,
-    };
-
-    const room: Room = {
-      id: roomId,
-      code: roomCode,
-      players: [host],
-      maxPlayers: 4,
+  async createRoom(hostId: string, hostName: string): Promise<Room> {
+    const room = this.roomRepo.create({
+      code: await this.generateUniqueRoomCode(),
       gameState: GameState.WAITING,
       currentBomb: '',
       turnOrder: [],
+      usedWords: [],
       currentTurn: 0,
       timeLeft: 15,
-      usedWords: [],
-      bombTimer: null,
-    };
+    });
 
-    this.rooms.set(roomId, room);
-    return room;
+    await this.roomRepo.save(room);
+
+    const host = this.playerRepo.create({
+      id: hostId,
+      name: hostName,
+      isHost: true,
+      room,
+    });
+
+    await this.playerRepo.save(host);
+
+    const fullRoom = await this.roomRepo.findOne({
+      where: { id: room.id },
+      relations: ['players'],
+    });
+
+    if (!fullRoom) {
+      throw new InternalServerErrorException('Room not found after creation');
+    }
+
+    return fullRoom;
   }
 
-  findRoomByCode(code: string): Room | null {
-    for (const room of this.rooms.values()) {
-      if (room.code === code) {
-        return room;
-      }
-    }
-    return null;
+  async findRoomByCode(code: string): Promise<Room | null> {
+    return await this.roomRepo.findOne({
+      where: { code },
+      relations: ['players'],
+    });
   }
 
-  findRoomByPlayerId(playerId: string): Room | null {
-    for (const room of this.rooms.values()) {
-      if (room.players.some(player => player.id === playerId)) {
-        return room;
-      }
-    }
-    return null;
+  async findRoomByPlayerId(playerId: string): Promise<Room | null> {
+    const player = await this.playerRepo.findOne({
+      where: { id: playerId },
+      relations: ['room'],
+    });
+    if (!player) return null;
+
+    return await this.roomRepo.findOne({
+      where: { id: player.room.id },
+      relations: ['players'],
+    });
   }
 
-  addPlayerToRoom(roomId: string, playerId: string, playerName: string): Player | null {
-    const room = this.rooms.get(roomId);
-    if (!room) return null;
+  async addPlayerToRoom(
+    roomId: string,
+    playerId: string,
+    playerName: string,
+  ): Promise<Player | null> {
+    const room = await this.roomRepo.findOne({
+      where: { id: roomId },
+      relations: ['players'],
+    });
 
-    if (room.players.length >= room.maxPlayers) {
-      return null;
-    }
+    if (!room || room.players.length >= room.maxPlayers) return null;
 
-    // Verificar si el jugador ya existe en la sala
-    const existingPlayer = room.players.find(p => p.id === playerId);
-    if (existingPlayer) {
-      return existingPlayer;
-    }
+    const alreadyInRoom = room.players.find((p) => p.id === playerId);
+    if (alreadyInRoom) return alreadyInRoom;
 
-    const newPlayer: Player = {
+    const newPlayer = this.playerRepo.create({
       id: playerId,
       name: playerName,
-      score: 0,
-      isHost: false,
-      currentWord: '',
-      isAlive: true,
-      lives: 3,
-    };
+      room,
+    });
 
-    room.players.push(newPlayer);
+    await this.playerRepo.save(newPlayer);
     return newPlayer;
   }
 
-  removePlayerFromRoom(roomId: string, playerId: string): boolean {
-    const room = this.rooms.get(roomId);
+  async removePlayerFromRoom(
+    roomId: string,
+    playerId: string,
+  ): Promise<boolean> {
+    const room = await this.roomRepo.findOne({
+      where: { id: roomId },
+      relations: ['players'],
+    });
     if (!room) return false;
 
-    const playerIndex = room.players.findIndex(p => p.id === playerId);
-    if (playerIndex === -1) return false;
+    const player = room.players.find((p) => p.id === playerId);
+    if (!player) return false;
 
-    const player = room.players[playerIndex];
-    room.players.splice(playerIndex, 1);
+    await this.playerRepo.delete(playerId);
 
-    // Si el host se va, asignar un nuevo host
-    if (player.isHost && room.players.length > 0) {
-      room.players[0].isHost = true;
+    if (player.isHost && room.players.length > 1) {
+      const nextHost = room.players.find((p) => p.id !== playerId);
+      if (nextHost) {
+        nextHost.isHost = true;
+        await this.playerRepo.save(nextHost);
+      }
     }
 
-    // Si no quedan jugadores, eliminar la sala
-    if (room.players.length === 0) {
-      this.rooms.delete(roomId);
-    }
-
-    return true;
-  }
-
-  startGame(roomId: string): boolean {
-    const room = this.rooms.get(roomId);
-    if (!room || room.gameState !== GameState.WAITING || room.players.length < 2) {
-      return false;
-    }
-
-    room.gameState = GameState.PLAYING;
-    room.turnOrder = room.players.map(p => p.id);
-    room.currentTurn = 0;
-    room.timeLeft = 15;
-    room.usedWords = [];
-
-    // Resetear stats de jugadores
-    room.players.forEach(player => {
-      player.score = 0;
-      player.isAlive = true;
-      player.lives = 3;
-      player.currentWord = '';
+    const updatedRoom = await this.roomRepo.findOne({
+      where: { id: roomId },
+      relations: ['players'],
     });
 
+    if (updatedRoom && updatedRoom.players.length === 0) {
+      await this.roomRepo.delete(roomId);
+    }
+
     return true;
   }
 
-  updatePlayerWord(roomId: string, playerId: string, word: string): boolean {
-    const room = this.rooms.get(roomId);
-    if (!room) return false;
+  async updatePlayerWord(
+    roomId: string,
+    playerId: string,
+    word: string,
+  ): Promise<boolean> {
+    const player = await this.playerRepo.findOne({
+      where: { id: playerId, room: { id: roomId } },
+    });
 
-    const player = room.players.find(p => p.id === playerId);
     if (!player) return false;
 
     player.currentWord = word;
+    await this.playerRepo.save(player);
     return true;
   }
 
-  submitWord(roomId: string, playerId: string, word: string): boolean {
-    const room = this.rooms.get(roomId);
-    if (!room || room.gameState !== GameState.PLAYING) return false;
-
-    const player = room.players.find(p => p.id === playerId);
-    if (!player || !player.isAlive) return false;
-
-    // Verificar si es el turno del jugador
-    const currentPlayerId = room.turnOrder[room.currentTurn];
-    if (currentPlayerId !== playerId) return false;
-
-    // Verificar si la palabra ya fue usada
-    if (room.usedWords.includes(word.toLowerCase())) {
-      return false;
-    }
-
-    room.usedWords.push(word.toLowerCase());
-    player.score += 10;
-    player.currentWord = '';
-
-    return true;
-  }
-
-  eliminatePlayer(roomId: string, playerId: string): Player | null {
-    const room = this.rooms.get(roomId);
-    if (!room) return null;
-
-    const player = room.players.find(p => p.id === playerId);
-    if (!player) return null;
-
-    player.lives--;
-    if (player.lives <= 0) {
-      player.isAlive = false;
-    }
-
-    return player;
-  }
-
-  nextTurn(roomId: string): string | null {
-    const room = this.rooms.get(roomId);
-    if (!room) return null;
-
-    const alivePlayers = room.players.filter(p => p.isAlive);
-    if (alivePlayers.length <= 1) {
-      room.gameState = GameState.FINISHED;
-      return null;
-    }
-
-    do {
-      room.currentTurn = (room.currentTurn + 1) % room.turnOrder.length;
-    } while (!room.players.find(p => p.id === room.turnOrder[room.currentTurn])?.isAlive);
-
-    room.timeLeft = 15;
-    return room.turnOrder[room.currentTurn];
-  }
-
-  getCurrentPlayer(roomId: string): Player | null {
-    const room = this.rooms.get(roomId);
-    if (!room || room.gameState !== GameState.PLAYING) return null;
-
-    const currentPlayerId = room.turnOrder[room.currentTurn];
-    return room.players.find(p => p.id === currentPlayerId) || null;
-  }
-
-  getWinner(roomId: string): Player | null {
-    const room = this.rooms.get(roomId);
-    if (!room) return null;
-
-    const alivePlayers = room.players.filter(p => p.isAlive);
-    return alivePlayers.length === 1 ? alivePlayers[0] : null;
-  }
-
-  resetRoomToLobby(roomId: string): boolean {
-    const room = this.rooms.get(roomId);
-    if (!room) return false;
-
-    room.gameState = GameState.WAITING;
-    room.currentBomb = '';
-    room.turnOrder = [];
-    room.currentTurn = 0;
-    room.timeLeft = 15;
-    room.usedWords = [];
-    
-    if (room.bombTimer) {
-      clearInterval(room.bombTimer);
-      room.bombTimer = null;
-    }
-
-    // Resetear jugadores
-    room.players.forEach(player => {
-      player.score = 0;
-      player.isAlive = true;
-      player.lives = 3;
-      player.currentWord = '';
+  async getRoom(roomId: string): Promise<Room | null> {
+    return await this.roomRepo.findOne({
+      where: { id: roomId },
+      relations: ['players'],
     });
-
-    return true;
   }
 
-  getRoom(roomId: string): Room | null {
-    return this.rooms.get(roomId) || null;
-  }
-
-  getAllRooms(): Room[] {
-    return Array.from(this.rooms.values());
-  }
-
-  private generateUniqueRoomId(): string {
-    let id: string;
-    do {
-      id = Math.random().toString(36).substring(2, 9);
-    } while (this.rooms.has(id));
-    return id;
-  }
-
-  private generateUniqueRoomCode(): string {
+  private async generateUniqueRoomCode(): Promise<string> {
     let code: string;
     do {
-      code = this.generateRoomCode();
-    } while (this.findRoomByCode(code));
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      code = [...Array(4)]
+        .map(() => String.fromCharCode(65 + Math.floor(Math.random() * 26)))
+        .join('');
+    } while (await this.roomRepo.findOne({ where: { code } }));
     return code;
   }
 }
